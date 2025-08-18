@@ -12,6 +12,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import gc
+import math
+import queue
 
 # 配置日志
 logging.basicConfig(
@@ -99,6 +101,8 @@ class ModelInference:
         self.model = None
         self.config = None
         self.loaded = False
+        self.model_params = 0
+        self.model_size_mb = 0
         
         # 检查模型目录是否存在
         if not self.model_dir.exists():
@@ -162,10 +166,22 @@ class ModelInference:
         self.model.load_state_dict(fixed_state_dict)
         self.model.eval()  # 设置为评估模式
         
+        # 计算模型参数
+        self._calculate_model_params()
+        
         self.loaded = True
-        logger.info(f"模型加载完成 (设备: {self.device})")
+        logger.info(f"模型加载完成 (设备: {self.device}, 参数: {self.model_params:,}, 大小: {self.model_size_mb:.2f} MB)")
         if self.app:
             self.app.log_message(f"模型加载完成 (设备: {self.device})")
+            self.app.log_message(f"模型参数: {self.model_params:,} (大小: {self.model_size_mb:.2f} MB)")
+    
+    def _calculate_model_params(self):
+        """计算模型参数数量和大小"""
+        total_params = sum(p.numel() for p in self.model.parameters())
+        self.model_params = total_params
+        
+        # 估计模型大小 (假设32位浮点数)
+        self.model_size_mb = total_params * 4 / (1024 ** 2)
     
     def _select_device(self, device):
         """智能选择设备"""
@@ -178,8 +194,8 @@ class ModelInference:
                 return torch.device("cpu")
         return torch.device(device)
     
-    def generate_text(self, prompt, max_length=100, temperature=0.7, top_k=50, top_p=0.9):
-        """生成文本"""
+    def generate_text_stream(self, prompt, max_length=100, temperature=0.7, top_k=50, top_p=0.9, char_delay=0.05):
+        """流式生成文本，逐个字符输出"""
         if not self.loaded:
             raise RuntimeError("模型未加载")
         
@@ -192,9 +208,10 @@ class ModelInference:
         
         # 生成文本
         generated_ids = []
+        generated_text = prompt
         
         with torch.no_grad():
-            for _ in range(max_length):
+            for i in range(max_length):
                 # 获取模型输出
                 outputs = self.model(input_tensor)
                 
@@ -230,6 +247,15 @@ class ModelInference:
                 # 添加到生成的序列中
                 generated_ids.append(next_token_id.item())
                 
+                # 解码新生成的token
+                new_token = self.tokenizer.decode([next_token_id.item()], skip_special_tokens=False)
+                
+                # 移除特殊标记
+                new_token = re.sub(r'\[[A-Z]+\]', '', new_token)
+                
+                # 更新生成的文本
+                generated_text += new_token
+                
                 # 如果生成了[SEP]或[PAD]则停止
                 if next_token_id in [self.tokenizer.token_to_id("[SEP]"), self.tokenizer.token_to_id("[PAD]")]:
                     break
@@ -240,26 +266,31 @@ class ModelInference:
                 # 如果输入序列太长，截断
                 if input_tensor.size(1) > self.config.get("max_seq_len", 256):
                     input_tensor = input_tensor[:, -self.config.get("max_seq_len", 256):]
+                
+                # 返回新生成的文本部分
+                yield new_token, generated_text
+                
+                # 添加延迟以模拟打字效果
+                time.sleep(char_delay)
         
-        # 解码生成的文本
-        generated_tokens = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
-        
-        # 移除特殊标记
-        generated_text = re.sub(r'\[[A-Z]+\]', '', generated_tokens)
-        
-        return prompt + generated_text
+        # 返回完整的生成文本
+        yield "", generated_text
 
 # GUI推理应用程序
 class InferenceApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Transformer语言模型推理器")
-        self.geometry("800x600")
+        self.geometry("900x700")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         
         # 模型状态
         self.model_loaded = False
         self.inference = None
+        self.generating = False
+        self.stop_generation = False
+        self.char_queue = queue.Queue()
+        self.char_delay = 50  # 每个字符的延迟（毫秒）
         
         # 创建主框架
         self.main_frame = ttk.Frame(self)
@@ -286,9 +317,38 @@ class InferenceApp(tk.Tk):
         # 加载模型按钮
         ttk.Button(control_frame, text="加载模型", command=self.load_model).grid(row=2, column=0, columnspan=3, pady=10)
         
+        # 模型信息显示
+        info_frame = ttk.LabelFrame(control_frame, text="模型信息")
+        info_frame.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=10)
+        
+        ttk.Label(info_frame, text="参数数量:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.params_var = tk.StringVar(value="未加载")
+        ttk.Label(info_frame, textvariable=self.params_var).grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(info_frame, text="模型大小:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.size_var = tk.StringVar(value="未加载")
+        ttk.Label(info_frame, textvariable=self.size_var).grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(info_frame, text="词表大小:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.vocab_var = tk.StringVar(value="未加载")
+        ttk.Label(info_frame, textvariable=self.vocab_var).grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # 打字速度控制
+        speed_frame = ttk.LabelFrame(control_frame, text="打字速度")
+        speed_frame.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=10)
+        
+        ttk.Label(speed_frame, text="字符延迟 (ms):").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.delay_var = tk.IntVar(value=50)
+        delay_scale = ttk.Scale(speed_frame, from_=0, to=200, variable=self.delay_var, 
+                               command=lambda v: self.delay_label.config(text=f"{float(v):.0f} ms"))
+        delay_scale.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=2)
+        
+        self.delay_label = ttk.Label(speed_frame, text=f"{self.delay_var.get()} ms")
+        self.delay_label.grid(row=0, column=2, padx=5, pady=2)
+        
         # 参数设置
         params_frame = ttk.LabelFrame(control_frame, text="生成参数")
-        params_frame.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=10)
+        params_frame.grid(row=5, column=0, columnspan=3, sticky=tk.EW, pady=10)
         
         ttk.Label(params_frame, text="生成长度:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.max_length_var = tk.IntVar(value=100)
@@ -314,12 +374,15 @@ class InferenceApp(tk.Tk):
         self.prompt_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.prompt_text.insert(tk.END, "从前，在一个遥远的王国里")
         
-        # 生成按钮
+        # 按钮区域
         btn_frame = ttk.Frame(self.main_frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
         
         self.generate_btn = ttk.Button(btn_frame, text="生成文本", command=self.generate_text, state=tk.DISABLED)
         self.generate_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(btn_frame, text="停止生成", command=self.stop_generation, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
         
         # 输出区域
         output_frame = ttk.LabelFrame(self.main_frame, text="生成结果")
@@ -353,12 +416,34 @@ class InferenceApp(tk.Tk):
         
         # 设置网格列权重
         control_frame.columnconfigure(1, weight=1)
+        
+        # 绑定快捷键
+        self.bind("<Control-l>", lambda e: self.load_model())
+        self.bind("<Control-g>", lambda e: self.generate_text())
+        self.bind("<Control-s>", lambda e: self.stop_generation())
+        
+        # 设置定时器处理字符队列
+        self.after(50, self.process_char_queue)
+    
+    def process_char_queue(self):
+        """处理字符队列，逐个显示字符"""
+        while not self.char_queue.empty():
+            char, full_text, progress = self.char_queue.get()
+            self.append_output(char)
+            
+            # 更新进度
+            if progress >= 0:
+                self.update_progress(progress, f"生成中: {progress:.1f}%")
+        
+        # 继续检查队列
+        self.after(10, self.process_char_queue)
     
     def log_message(self, message, level="info"):
         """记录日志消息"""
         def update_log():
             # 在输出文本框中显示消息
             self.output_text.config(state=tk.NORMAL)
+            
             # 添加带颜色的标签
             if level == "error":
                 self.output_text.insert(tk.END, f"{time.strftime('%H:%M:%S')} [ERROR] ", "error")
@@ -375,6 +460,17 @@ class InferenceApp(tk.Tk):
             self.status_var.set(message[:100])  # 显示前100个字符
         
         self.after(0, update_log)
+    
+    def append_output(self, text, prefix="", level="info"):
+        """线程安全地追加文本到输出框"""
+        def _append():
+            self.output_text.config(state=tk.NORMAL)
+            if prefix:
+                self.output_text.insert(tk.END, prefix)
+            self.output_text.insert(tk.END, text)
+            self.output_text.see(tk.END)
+            self.output_text.config(state=tk.DISABLED)
+        self.after(0, _append)
     
     def update_progress(self, value, text=None):
         """更新进度条"""
@@ -411,6 +507,7 @@ class InferenceApp(tk.Tk):
         # 更新UI状态
         self.status_var.set("加载模型中...")
         self.update_progress(0, "加载模型...")
+        self.log_message(f"开始加载模型: {model_dir}")
         
         # 在后台线程中加载模型
         threading.Thread(
@@ -429,6 +526,12 @@ class InferenceApp(tk.Tk):
             )
             self.model_loaded = True
             self.generate_btn.config(state=tk.NORMAL)
+            
+            # 更新模型信息显示
+            self.params_var.set(f"{self.inference.model_params:,}")
+            self.size_var.set(f"{self.inference.model_size_mb:.2f} MB")
+            self.vocab_var.set(f"{self.inference.tokenizer.get_vocab_size()}")
+            
             self.status_var.set("模型加载成功")
             self.log_message("模型加载成功")
             self.update_progress(100, "模型加载完成!")
@@ -437,6 +540,8 @@ class InferenceApp(tk.Tk):
             self.log_message(traceback.format_exc(), level="error")
             self.status_var.set(f"加载模型失败: {str(e)}")
             self.update_progress(0, "加载失败")
+            self.model_loaded = False
+            self.generate_btn.config(state=tk.DISABLED)
     
     def generate_text(self):
         """生成文本"""
@@ -455,76 +560,104 @@ class InferenceApp(tk.Tk):
         temperature = self.temperature_var.get()
         top_k = self.top_k_var.get()
         top_p = self.top_p_var.get()
+        char_delay = self.delay_var.get() / 1000.0  # 毫秒转换为秒
+        
+        # 清除之前的输出
+        self.output_text.config(state=tk.NORMAL)
+        self.output_text.delete(1.0, tk.END)
+        self.output_text.config(state=tk.DISABLED)
         
         # 更新UI状态
+        self.generating = True
+        self.stop_generation = False
         self.status_var.set("生成文本中...")
         self.update_progress(0, "生成文本...")
+        self.log_message(f"开始生成文本 (长度={max_length}, 温度={temperature}, top_k={top_k}, top_p={top_p})")
+        self.log_message(f"提示: {prompt}")
+        self.log_message("生成结果: ")
         
         # 在后台线程中生成文本
+        self.generate_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        
         threading.Thread(
             target=self._generate_text_thread,
-            args=(prompt, max_length, temperature, top_k, top_p),
+            args=(prompt, max_length, temperature, top_k, top_p, char_delay),
             daemon=True
         ).start()
     
-    def _generate_text_thread(self, prompt, max_length, temperature, top_k, top_p):
-        """后台线程生成文本"""
+    def stop_generation(self):
+        """停止文本生成"""
+        if self.generating:
+            self.stop_generation = True
+            self.status_var.set("正在停止生成...")
+            self.log_message("用户请求停止生成")
+    
+    def _generate_text_thread(self, prompt, max_length, temperature, top_k, top_p, char_delay):
+        """后台线程生成文本（流式）"""
         try:
-            # 生成文本
             start_time = time.time()
+            char_count = 0
             
-            # 在输出区域显示提示
-            self.log_message(f"提示: {prompt}")
-            self.log_message(f"开始生成文本 (长度={max_length}, 温度={temperature}, top_k={top_k}, top_p={top_p})")
+            # 创建生成器
+            generator = self.inference.generate_text_stream(
+                prompt,
+                max_length=max_length,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                char_delay=char_delay
+            )
             
-            # 分步生成文本，更新进度
-            generated_text = ""
-            step = max(1, max_length // 20)  # 每5%更新一次进度
-            
-            for i in range(0, max_length, step):
-                # 生成下一部分文本
-                partial_length = min(step, max_length - i)
-                generated = self.inference.generate_text(
-                    prompt + generated_text,
-                    max_length=partial_length,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p
-                )
+            # 逐个获取生成的token
+            for new_char, full_text in generator:
+                if self.stop_generation:
+                    break
                 
-                # 获取新生成的部分
-                new_text = generated[len(prompt + generated_text):]
-                generated_text += new_text
+                # 更新字符计数
+                char_count += len(new_char)
                 
-                # 更新输出
-                self.log_message(f"生成进度: {len(generated_text)}/{max_length} 字符")
-                self.log_message(f"新内容: {new_text}")
+                # 计算进度
+                progress = min(100, char_count / max_length * 100)
                 
-                # 更新进度
-                progress = min(100, (i + step) / max_length * 100)
-                self.update_progress(progress, f"生成中: {progress:.1f}%")
-            
-            # 显示最终结果
-            self.log_message("\n最终生成结果:")
-            self.log_message(generated_text)
+                # 将字符放入队列供主线程处理
+                self.char_queue.put((new_char, full_text, progress))
             
             # 计算时间
             gen_time = time.time() - start_time
-            tokens_per_sec = max_length / gen_time if gen_time > 0 else 0
+            speed = char_count / gen_time if gen_time > 0 else 0
             
-            # 完成消息
-            self.log_message(f"\n生成完成! 总时间: {gen_time:.2f}秒, 速度: {tokens_per_sec:.1f} 字符/秒")
-            self.update_progress(100, "生成完成!")
+            # 更新UI状态
+            self.char_queue.put(("", "", 100))  # 确保进度更新为100%
+            
+            # 显示统计信息
+            self.log_message(f"\n生成完成! 总时间: {gen_time:.2f}秒, 速度: {speed:.1f} 字符/秒")
+            self.log_message(f"生成字符数: {char_count}")
+            
             self.status_var.set("文本生成完成")
+            self.generating = False
+            
+            # 更新按钮状态
+            self.generate_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            
         except Exception as e:
             self.log_message(f"生成文本失败: {str(e)}", level="error")
             self.log_message(traceback.format_exc(), level="error")
             self.status_var.set(f"生成失败: {str(e)}")
             self.update_progress(0, "生成失败")
+            self.generating = False
+            self.generate_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
     
     def on_close(self):
         """关闭应用程序"""
-        self.destroy()
+        if self.generating:
+            self.stop_generation = True
+            if messagebox.askyesno("确认", "文本生成仍在进行中，确定要退出吗？"):
+                self.destroy()
+        else:
+            self.destroy()
 
 # 主函数
 def main():
